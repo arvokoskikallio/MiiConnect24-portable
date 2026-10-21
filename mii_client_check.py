@@ -14,6 +14,8 @@ Profile lookups prefer local CTGP JSON, then the saved SQLite index. A profile
 missing locally may be fetched online, reading each ghost's RKG header. Network
 results are cached in mii_client_check_cache. Top1000 uses only your local PID-to-name JSON and Mii binaries, matched by
 exact filename/stem. No Top1000 page requests or name-only client inference.
+Friend codes are computed only from Top1000 online PIDs. Ghost Database
+profile links use the decimal Mii client ID, never the friend-code formula.
 """
 import argparse
 import binascii
@@ -48,6 +50,21 @@ def client_id(value):
     if re.fullmatch('[0-9a-fA-F]{8}',value):return value.upper()
     if value.isdecimal() and len(value)>8 and int(value)<=0xffffffff:return f'{int(value):08X}'
     raise ValueError('Enter 8 hex digits (e.g. 3A91E839), or dec:99717566')
+
+
+def top1000_friend_code(pid):
+    """Convert an online/Top1000 PID, never a Mii client ID, into an MKW FC."""
+    value=str(pid)
+    if not re.fullmatch('[0-9]+',value) or not 0<=int(value)<=0xffffffff:raise ValueError('Online PID must be a 32-bit unsigned integer')
+    number=int(value);checksum=hashlib.md5(number.to_bytes(4,'little')+b'JCMR').digest()[0]>>1
+    code=f'{((checksum<<32)|number) if number else 0:012d}'
+    return '-'.join(code[i:i+4] for i in (0,4,8))
+
+
+def ghost_database_profile_url(client):
+    value=str(client or '').upper()
+    if not re.fullmatch('[0-9A-F]{8}',value) or value in BAD:return ''
+    return 'https://ninrankings.org/ghostdatabase/profil.php?id='+str(int(value,16))
 
 
 def profile_url(pid):return CHAD+f'players/{pid[:2]}/{pid[2:]}.html'
@@ -153,7 +170,7 @@ def prepare_local_miis(args):
         args._nin_pid_data=json.loads(args.nin_pids_json.read_text(encoding='utf-8-sig'))
         if not isinstance(args._nin_pid_data,dict):raise ValueError('PID JSON must map profile IDs to lists of Mii names')
         for pid,names in args._nin_pid_data.items():
-            if not pid.isdecimal() or not isinstance(names,list) or any(not isinstance(n,str) for n in names):raise ValueError('Expected numeric PID -> list of Mii-name strings')
+            if not pid.isdecimal() or not 0<int(pid)<=0xffffffff or not isinstance(names,list) or any(not isinstance(n,str) for n in names):raise ValueError('Expected numeric PID -> list of Mii-name strings')
     if not hasattr(args,'_mii_paths'):
         print('  Listing local Mii filenames (once for this session)...',flush=True)
         args._mii_paths=defaultdict(set)
@@ -215,6 +232,7 @@ def top1000(value,args):
         found=parse_qs(u.query).get('id',[])
         if len(found)!=1 or not found[0].isdigit():raise ValueError('Missing numeric profile ID')
         pid=found[0]
+    print('  Input Top1000 profile PID:',pid,'| Friend code:',top1000_friend_code(pid))
     prepare_local_miis(args)
     names=args._nin_pid_data.get(pid)
     if names is None:raise ValueError('NinRankings PID not present in the supplied JSON')
@@ -295,6 +313,7 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
         print('\n'+'='*64+'\nCLIENT '+client+' | decimal '+str(int(client,16)))
         if client in BAD or (db and db.execute('SELECT 1 FROM blocked WHERE client=?',(client,)).fetchone()):
             print('Excluded: placeholder/default-Mii client ID.');continue
+        print('Ghost Database profile: '+ghost_database_profile_url(client))
         avatars={x['avatar'] for x in items if x['avatar'] and x['avatar'] not in BAD}
         if any(item['name'] for item in items):
             print('MIIS READ FROM YOUR INPUT:');show_miis(items,set())
@@ -304,6 +323,7 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
         print('\nMATCHING NINRANKINGS TOP1000 PROFILES:',len(visible))
         for pid,rows in sorted(visible.items()):
             print('  https://ninrankings.org/mkwii/profil.php?id='+pid)
+            print('  Friend code: '+top1000_friend_code(pid)+' | Top1000 online PID: '+pid)
             show_miis(rows,avatars)
         if db is None:
             print('No MiiConnect24 index: CTGP/Ghost Database comparisons unavailable.');continue
@@ -321,7 +341,7 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
             if ghost in seen:continue
             seen.add(ghost)
             mapped=db.execute('SELECT profile_id FROM nin_profiles WHERE ghost_id=?',(row['ghost_id'],)).fetchone() if has_mapping else None
-            pid=mapped[0] if mapped and mapped[0] else ''
+            pid=mapped[0] if mapped and mapped[0] else str(int(client,16))
             key=('profile',pid) if pid else ('mii',row['avatar'])
             item=dict(row);item['ghost']=ghost;item['url']='https://ninrankings.org/ghostdatabase/ghostviewer.php?id='+row['ghost_id'] if row['ghost_id'] else ''
             nin[key].append(item)
