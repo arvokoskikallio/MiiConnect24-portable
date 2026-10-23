@@ -16,7 +16,9 @@ python mii_client_check.py --refresh-index --index-only
 Profile lookups prefer local CTGP JSON, then the saved SQLite index. A profile
 missing locally may be fetched online, reading each ghost's RKG header. Network
 results are cached in mii_client_check_cache. Top1000 uses only your local PID-to-name JSON and Mii binaries, matched by
-exact filename/stem. No Top1000 page requests or name-only client inference.
+case-sensitive filename/stem plus numbered duplicate variants (Name_1.mii).
+Ambiguous filename associations are labelled as candidates, not proven ownership.
+No Top1000 page requests or name-only client-ID inference.
 Friend codes are computed only from Top1000 online PIDs. Ghost Database
 profile links use the decimal Mii client ID, never the friend-code formula.
 """
@@ -179,12 +181,47 @@ def prepare_local_miis(args):
             if not pid.isdecimal() or not 0<int(pid)<=0xffffffff or not isinstance(names,list) or any(not isinstance(n,str) for n in names):raise ValueError('Expected numeric PID -> list of Mii-name strings')
     if not hasattr(args,'_mii_paths'):
         print('  Listing local Mii filenames (once for this session)...',flush=True)
-        args._mii_paths=defaultdict(set)
+        args._mii_paths=defaultdict(set);args._mii_duplicates=defaultdict(set)
         for path in args.mii_dir.rglob('*'):
-            if path.is_file():
+            if path.is_file() and path.suffix.lower()=='.mii':
                 args._mii_paths[path.name].add(path)
                 args._mii_paths[path.stem].add(path)
+                match=re.fullmatch(r'(.+)_([0-9]+)',path.stem)
+                if match:args._mii_duplicates[match[1]].add(path)
 
+
+
+def mii_filename_candidates(name,args):
+    name=name.replace('\x00','')
+    stem=name[:-4] if name.lower().endswith('.mii') else name
+    exact=set(args._mii_paths.get(name,set()))
+    # Extension spelling is immaterial; the name itself remains case-sensitive.
+    exact.update(args._mii_paths.get(stem,set()))
+    variants=set(getattr(args,'_mii_duplicates',{}).get(stem,set()))
+    return exact|variants,exact,stem
+
+
+def candidate_mii(path,args,name,paths,exact):
+    item=dict(cached_mii(path,args))
+    stem=name[:-4] if name.lower().endswith('.mii') else name
+    if path not in exact and item['name']!=stem:
+        raise ValueError('Numbered filename resembles the JSON name, but its embedded Mii name differs; excluded')
+    ambiguous=len(paths)>1 or path not in exact
+    item['filename_candidate']=ambiguous
+    item['json_name']=name
+    if ambiguous:item['association_note']='Filename/name candidate only; this Mii is not confirmed to belong to the Top1000 PID'
+    return item
+
+
+def write_lookup_issues(args,pid,missing,failures,ambiguous):
+    args.cache.mkdir(parents=True,exist_ok=True)
+    path=args.cache/'top1000_lookup_issues.csv'
+    with path.open('w',encoding='utf-8-sig',newline='') as stream:
+        writer=csv.writer(stream);writer.writerow(['pid','type','json_name','file','details'])
+        writer.writerows((pid,'missing',name,'','No exact or numbered duplicate Mii filename found') for name in missing)
+        writer.writerows((pid,'unreadable_or_excluded','',file,error) for file,error in failures)
+        writer.writerows((pid,'filename_candidate',name,file,'Association uncertain; verify the profile manually') for name,file in ambiguous)
+    if missing or failures or ambiguous:print('  Lookup details: '+str(path))
 
 def cached_mii(path,args):
     if not hasattr(args,'_mii_binary_cache'):
@@ -204,28 +241,32 @@ def top1000_matches(args):
     if hasattr(args,'_top_matches'):return args._top_matches
     if not args.nin_pids_json.is_file() or not args.mii_dir.is_dir():return {}
     prepare_local_miis(args)
-    result=defaultdict(lambda:defaultdict(dict));missing=[];failures=[]
+    result=defaultdict(lambda:defaultdict(dict));missing=[];failures=[];ambiguities=[]
     entries=list(args._nin_pid_data.items())
     for i,(pid,names) in enumerate(entries,1):
         for n in names:
             n=n.replace('\x00','')
             if not useful(n):continue
-            paths=args._mii_paths.get(n,set())
+            paths,exact,stem=mii_filename_candidates(n,args)
             if not paths:missing.append((pid,n));continue
             for path in sorted(paths):
                 try:
-                    item=cached_mii(path,args)
-                    if useful(item['name']) and item['client'] not in BAD:result[item['client']][pid][str(path.resolve())]=item
+                    item=candidate_mii(path,args,n,paths,exact)
+                    if item.get('filename_candidate'):ambiguities.append((pid,n,str(path)))
+                    if useful(item['name']) and item['client'] not in BAD:
+                        key=str(path.resolve());previous=result[item['client']][pid].get(key)
+                        if previous is None or not item['filename_candidate']:result[item['client']][pid][key]=item
                 except (OSError,ValueError) as e:failures.append((str(path),str(e)))
         if i%500==0 or i==len(entries):print(f'  Local Top1000 Miis: {i}/{len(entries)} profiles checked',flush=True)
     args._top_matches={c:{pid:list(items.values()) for pid,items in profiles.items()} for c,profiles in result.items()}
-    if missing or failures:
+    if missing or failures or ambiguities:
         args.cache.mkdir(parents=True,exist_ok=True)
         with (args.cache/'top1000_mii_issues.csv').open('w',encoding='utf-8-sig',newline='') as f:
             w=csv.writer(f);w.writerow(['type','reference','details'])
             w.writerows(('missing',pid,n) for pid,n in missing)
             w.writerows(('unreadable',path,error) for path,error in failures)
-        print(f'  Top1000 coverage incomplete: {len(missing)} missing names, {len(failures)} invalid files. See {args.cache/"top1000_mii_issues.csv"}')
+            w.writerows(('filename_candidate',pid,n+' -> '+path+'; ownership unverified') for pid,n,path in ambiguities)
+        print(f'  Top1000 filename report: {len(missing)} missing names, {len(failures)} invalid/excluded files, {len(ambiguities)} ambiguous filename associations. See {args.cache/"top1000_mii_issues.csv"}')
     return args._top_matches
 
 
@@ -242,19 +283,21 @@ def top1000(value,args):
     prepare_local_miis(args)
     names=args._nin_pid_data.get(pid)
     if names is None:raise ValueError('NinRankings PID not present in the supplied JSON')
-    result=[];missing=[];failures=[];seen=set()
+    result=[];missing=[];failures=[];seen=set();ambiguities=[]
     for n in names:
         n=n.replace('\x00','')
         if not useful(n):continue
-        paths=args._mii_paths.get(n,set())
+        paths,exact,stem=mii_filename_candidates(n,args)
         if not paths:missing.append(n);continue
-        if len(paths)>1:print(f'  {n!r}: {len(paths)} exact filename matches; checking all of them.')
+        if len(paths)>1 or paths-exact:
+            print(f'  {n!r}: checking {len(paths)} exact/numbered filename candidates. Which files belong to this PID is unverified.')
         for path in sorted(paths):
             if path in seen:continue
             seen.add(path)
             try:
-                item=cached_mii(path,args)
-                # File mapping is taken literally; show the embedded name too.
+                item=candidate_mii(path,args,n,paths,exact)
+                if item['filename_candidate']:ambiguities.append((n,str(path)))
+                # Embedded client IDs are real; ambiguous PID associations remain labelled.
                 print('  Mii file:',path)
                 print('    Embedded name:',repr(item['name']),'| client',item['client'],'| Mii ID',item['avatar'])
                 result.append(item)
@@ -262,7 +305,11 @@ def top1000(value,args):
     for n in missing:print('  Missing local Mii file for JSON name:',repr(n))
     for path,error in failures:print('  Invalid/unreadable Mii file:',path,'|',error)
     if missing or failures:print('  INCOMPLETE: missing/invalid Mii files listed above were not included.')
-    if not result:raise ValueError('No readable non-default Mii files found for this PID. JSON names must match exact filenames or filename stems, e.g. TheLetta Σ -> TheLetta Σ.mii.')
+    write_lookup_issues(args,pid,missing,failures,ambiguities)
+    if not result:
+        print('  No usable Mii files found for this PID. Returning to the menu; check --mii-dir and the filename report.')
+        return [],set()
+    if ambiguities:print('  NAME AMBIGUITY: results from these files are candidates. Their client IDs do not establish that they belong to the requested Top1000 profile.')
     print('  Read client IDs directly from local Mii binaries. No online lookup or PID-to-client conversion.')
     return result,set()
 
@@ -469,7 +516,7 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
         print('Ghost Database profile: '+ghost_database_profile_url(client))
         avatars={x['avatar'] for x in items if x['avatar'] and x['avatar'] not in BAD}
         if any(item['name'] for item in items):
-            print('MIIS READ FROM YOUR INPUT:');show_miis(items,set())
+            print('MIIS FROM INPUT FILENAME CANDIDATES (PROFILE OWNERSHIP UNVERIFIED):' if any(item.get('filename_candidate') for item in items) else 'MIIS READ FROM YOUR INPUT:');show_miis(items,set())
         else:print('Client ID entered manually; no specific Mii/avatar supplied.')
         top=(top_matches or {}).get(client,{})
         visible={pid:rows for pid,rows in top.items() if pid!=exclude_nin_pid}
@@ -477,6 +524,7 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
         for pid,rows in sorted(visible.items()):
             print('  https://ninrankings.org/mkwii/profil.php?id='+pid)
             print('  Friend code: '+top1000_friend_code(pid)+' | Top1000 online PID: '+pid)
+            if any(row.get('filename_candidate') for row in rows):print('  Filename/name candidates only: duplicate names prevent confirming which Miis belong to this PID.')
             show_miis(rows,avatars)
         if db is None:
             print('No MiiConnect24 index: CTGP/Ghost Database comparisons unavailable.');continue
@@ -548,6 +596,7 @@ def main():
                     else:miis=[parse_mii(Path(value).read_bytes(),value)]
                 elif choice=='3':miis,source=top1000(value,args)
                 else:miis=[{'client':client_id(value),'avatar':'','name':'','ghost':'','url':'','manual':True}]
+                if not miis:continue
                 top=top1000_matches(args)
                 exclude_nin=None
                 if choice=='3':exclude_nin=value if value.isdecimal() else parse_qs(urlparse(value).query).get('id',[None])[0]
