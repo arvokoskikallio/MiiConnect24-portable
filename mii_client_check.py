@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Interactive Mii client-ID lookup against an existing MiiConnect24 index.
-Python 3.10+, standard library only. Does not alter the index or assignments.
+"""MiiConnect24 Portable: interactive Mii client-ID lookup from local dumps.
+Python 3.10+, standard library only. Never changes source dumps or assignments.
+Automatically builds a reusable local SQLite cache; no prebuilt index required.
 
 python mii_client_check.py
+python mii_client_check.py --ctgp-dir ctgp_profiles --ninrankings-dir ninrankings
 python mii_client_check.py --identities players.csv --nin-pids-json ninrankings_pids.json --mii-dir miis
+python mii_client_check.py --refresh-index --index-only
 
 1 Chadsoft profile (ID, URL or local JSON)
 2 Local .rkg/.mii file or a direct ghost URL
@@ -21,6 +24,9 @@ import argparse
 import binascii
 from collections import defaultdict
 import csv
+from contextlib import contextmanager
+import os
+import time
 import hashlib
 import json
 from pathlib import Path
@@ -261,6 +267,153 @@ def top1000(value,args):
     return result,set()
 
 
+
+@contextmanager
+def dump_index_lock(cache):
+    cache.mkdir(parents=True,exist_ok=True)
+    with (cache/'dump_index.lock').open('a+b') as stream:
+        try:
+            if os.name=='nt':
+                import msvcrt
+                stream.seek(0);stream.write(b'0');stream.flush();stream.seek(0)
+                msvcrt.locking(stream.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError as exc:raise ValueError('Another Portable process is building the comparison cache. Close it and retry.') from exc
+        try:yield
+        finally:
+            if os.name=='nt':
+                stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
+            else:fcntl.flock(stream.fileno(),fcntl.LOCK_UN)
+
+
+def open_dump_index(path):
+    # Only our marked cache may be opened for writes. Explicit --index stays read-only.
+    if path.exists():
+        check=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True)
+        try:
+            marked=check.execute("SELECT value FROM portable_meta WHERE key='schema'").fetchone()
+            if not marked or marked[0]!='1':raise ValueError('Unrecognised cache schema; use a different --cache folder')
+        except sqlite3.Error as exc:raise ValueError('Existing dump_index.sqlite3 is not a Portable cache; choose another --cache folder') from exc
+        finally:check.close()
+    db=sqlite3.connect(path,timeout=30);db.row_factory=sqlite3.Row
+    db.executescript("""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS portable_meta(key TEXT PRIMARY KEY,value TEXT);
+        INSERT OR IGNORE INTO portable_meta VALUES('schema','1');
+        CREATE TABLE IF NOT EXISTS portable_files(kind TEXT,path TEXT,mtime INTEGER,size INTEGER,error TEXT,PRIMARY KEY(kind,path));
+        CREATE TABLE IF NOT EXISTS ctgp(path TEXT,pid TEXT,ghost TEXT,avatar TEXT,client TEXT,name TEXT,creator TEXT,PRIMARY KEY(path,pid,ghost));
+        CREATE TABLE IF NOT EXISTS nin(path TEXT PRIMARY KEY,ghost_id TEXT,avatar TEXT,client TEXT,name TEXT,creator TEXT);
+        CREATE INDEX IF NOT EXISTS ctgp_client ON ctgp(client);
+        CREATE INDEX IF NOT EXISTS ctgp_pid ON ctgp(pid);
+        CREATE INDEX IF NOT EXISTS nin_client ON nin(client);
+    """)
+    return db
+
+
+def dump_rows(kind,path):
+    if kind=='nin':
+        # Header includes the 74-byte Mii and its CRC16: never read the full ghost.
+        with path.open('rb') as stream:item=parse_mii(stream.read(0x88),str(path))
+        match=re.match(r'^(\d+)-',path.name)
+        return [(str(path),str(int(match[1])) if match else '',item['avatar'],item['client'],item['name'],'')]
+    with path.open(encoding='utf-8-sig') as stream:data=json.load(stream)
+    if not isinstance(data,dict):raise ValueError('Expected a CTGP profile JSON object')
+    pid=str(data.get('player_id','')).upper()
+    if not re.fullmatch('[0-9A-F]{16}',pid):raise ValueError('Invalid CTGP player_id; expected enriched CTGP dump format')
+    if re.fullmatch('[0-9a-fA-F]{16}',path.stem) and path.stem.upper()!=pid:raise ValueError('JSON player_id differs from filename')
+    items=json_miis(data,pid);rows=[];seen={}
+    for item,g in zip(items,data['ghosts']):
+        ghost=str(item['ghost'])
+        if not re.fullmatch(r'[0-9a-fA-F]{40}\.rkg',ghost,re.I):raise ValueError('Ghost file field must be a 40-hex hash followed by .rkg')
+        avatar=item['avatar']
+        if avatar and not re.fullmatch('[0-9A-F]{8}',avatar):raise ValueError('Invalid avatar_id')
+        row=(str(path),pid,ghost.upper()[:-4]+'.rkg',avatar,item['client'],item['name'],str(g['mii'].get('creator_name') or '').replace('\x00',''))
+        if ghost.upper() in seen and seen[ghost.upper()]!=row:raise ValueError('Conflicting duplicate ghost metadata within the profile')
+        seen[ghost.upper()]=row
+    rows.extend(seen.values());return rows
+
+
+def scan_dump(db,kind,folder,refresh=False):
+    suffix='.json' if kind=='ctgp' else '.rkg'
+    print('Listing '+str(folder)+' ('+suffix+')...',flush=True)
+    paths=sorted({p.resolve() for p in folder.rglob('*') if p.is_file() and p.suffix.lower()==suffix})
+    if not paths:raise ValueError('No '+suffix+' files found in '+str(folder)+'. Extract the dump first.')
+    root=str(folder.resolve());setmeta=lambda k,v:db.execute('INSERT OR REPLACE INTO portable_meta VALUES(?,?)',(k,str(v)))
+    oldroot=db.execute('SELECT value FROM portable_meta WHERE key=?',('root_'+kind,)).fetchone()
+    # An interrupted refresh must be resumed, even if a previously complete cache exists.
+    setmeta('complete_'+kind,'0');db.commit()
+    seen=set();changed=errors=0;start=time.monotonic()
+    try:
+        for i,path in enumerate(paths,1):
+            key=str(path);seen.add(key)
+            try:
+                stat=path.stat();old=db.execute('SELECT * FROM portable_files WHERE kind=? AND path=?',(kind,key)).fetchone()
+                if old and old['mtime']==stat.st_mtime_ns and old['size']==stat.st_size and not old['error'] and not refresh:
+                    pass
+                else:
+                    rows=dump_rows(kind,path)
+                    after=path.stat()
+                    if (after.st_mtime_ns,after.st_size)!=(stat.st_mtime_ns,stat.st_size):raise ValueError('File changed during indexing; retry after it finishes copying')
+                    db.execute('DELETE FROM '+kind+' WHERE path=?',(key,))
+                    if rows:db.executemany('INSERT INTO '+kind+' VALUES('+','.join('?' for _ in rows[0])+')',rows)
+                    db.execute('INSERT OR REPLACE INTO portable_files VALUES(?,?,?,?,NULL)',(kind,key,stat.st_mtime_ns,stat.st_size));changed+=1
+            except (OSError,ValueError,TypeError,AttributeError,KeyError) as exc:
+                # Never retain outdated rows from a now invalid input file.
+                db.execute('DELETE FROM '+kind+' WHERE path=?',(key,))
+                db.execute('INSERT OR REPLACE INTO portable_files VALUES(?,?,?,?,?)',(kind,key,0,0,str(exc)));changed+=1;errors+=1
+            if i%100==0:db.commit()
+            if i%500==0 or i==len(paths):
+                elapsed=time.monotonic()-start;eta=elapsed/i*(len(paths)-i)
+                print(f'  {kind}: {i:,}/{len(paths):,} | parsed {changed:,} | errors {errors:,} | elapsed {elapsed/60:.1f}m | ETA {eta/60:.1f}m',flush=True)
+        # Remove disappeared files only after a full, successful directory listing/scan.
+        stale=[r[0] for r in db.execute('SELECT path FROM portable_files WHERE kind=?',(kind,)) if r[0] not in seen]
+        for key in stale:
+            db.execute('DELETE FROM '+kind+' WHERE path=?',(key,));db.execute('DELETE FROM portable_files WHERE kind=? AND path=?',(kind,key))
+        setmeta('root_'+kind,root);setmeta('complete_'+kind,'1');db.commit()
+    finally:db.commit()
+
+
+def prepare_dump_index(args):
+    explicit=getattr(args,'index',None)
+    if explicit is not None:
+        if not explicit.is_file():raise ValueError('--index does not exist. Omit --index to build automatically from the dumps.')
+        print('Using supplied comparison index read-only: '+str(explicit),flush=True)
+        return explicit
+    cachefile=args.cache/'dump_index.sqlite3'
+    available=[(kind,folder) for kind,folder in [('ctgp',args.ctgp_dir),('nin',args.ninrankings_dir)] if folder.is_dir()]
+    if not available and not cachefile.is_file():
+        legacy=Path('mii_identity_matches/index.sqlite3')
+        if legacy.is_file() and not args.refresh_index:
+            print('Using existing MiiConnect24 index read-only: '+str(legacy));return legacy
+        print('No comparison dumps/cache found. Supply --ctgp-dir and/or --ninrankings-dir to enable comparisons.')
+        return None
+    with dump_index_lock(args.cache):
+        db=open_dump_index(cachefile)
+        try:
+            meta=dict(db.execute('SELECT key,value FROM portable_meta'))
+            if args.refresh_index and not available:raise ValueError('--refresh-index needs at least one available dump folder')
+            for kind,folder in available:
+                root=str(folder.resolve())
+                if args.refresh_index or meta.get('complete_'+kind)!='1' or meta.get('root_'+kind)!=root:
+                    # Fingerprints reuse unchanged files; --reparse-index forces binary/JSON decoding.
+                    scan_dump(db,kind,folder,getattr(args,'reparse_index',False))
+                else:print('  Reusing '+kind+' comparison cache. Added/changed/removed files? Use --refresh-index.',flush=True)
+            for kind in ('ctgp','nin'):
+                count=db.execute('SELECT COUNT(*) FROM '+kind).fetchone()[0]
+                complete=db.execute('SELECT value FROM portable_meta WHERE key=?',('complete_'+kind,)).fetchone()
+                print(f'  Indexed {kind}: {count:,} ghost rows'+(' (incomplete scan; supply its dump folder to resume)' if complete and complete[0]!='1' else ''),flush=True)
+                if not count:print('  '+('CTGP comparisons unavailable; supply --ctgp-dir.' if kind=='ctgp' else 'Ghost Database comparisons unavailable; supply --ninrankings-dir.'),flush=True)
+            path=args.cache/'dump_index_errors.csv'
+            with path.open('w',encoding='utf-8-sig',newline='') as stream:
+                writer=csv.writer(stream);writer.writerow(['source','file','error']);writer.writerows(tuple(r) for r in db.execute('SELECT kind,path,error FROM portable_files WHERE error IS NOT NULL ORDER BY kind,path'))
+            errors=db.execute('SELECT COUNT(*) FROM portable_files WHERE error IS NOT NULL').fetchone()[0]
+            if errors:print(f'WARNING: {errors:,} files excluded; see {path}. Fix them and run --refresh-index.',flush=True)
+            print('Comparison cache: '+str(cachefile.resolve()),flush=True)
+        finally:db.close()
+    return cachefile
+
 def connect(path):
     if not path.is_file():return None
     db=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True);db.row_factory=sqlite3.Row
@@ -269,7 +422,7 @@ def connect(path):
     db.create_function('useful_mii',1,useful,deterministic=True)
     print('Loading default-Mii exclusions from the existing index...',flush=True)
     db.execute('CREATE TEMP TABLE blocked(client TEXT PRIMARY KEY)')
-    db.execute("INSERT OR IGNORE INTO blocked SELECT client FROM ctgp WHERE useful_mii(name)=0 UNION SELECT client FROM nin WHERE useful_mii(name)=0")
+    db.execute("INSERT OR IGNORE INTO blocked SELECT client FROM (SELECT DISTINCT client,name FROM ctgp) WHERE useful_mii(name)=0 UNION SELECT client FROM (SELECT DISTINCT client,name FROM nin) WHERE useful_mii(name)=0")
     db.executescript('CREATE TEMP VIEW eligible_ctgp AS SELECT * FROM ctgp WHERE useful_mii(name)=1 AND client NOT IN(SELECT client FROM blocked); CREATE TEMP VIEW eligible_nin AS SELECT * FROM nin WHERE useful_mii(name)=1 AND client NOT IN(SELECT client FROM blocked);')
     return db
 
@@ -355,14 +508,26 @@ def check(miis,source_pids,db,known,top_matches=None,exclude_nin_pid=None):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--index',type=Path,default=Path('mii_identity_matches/index.sqlite3'))
+    p.add_argument('--index',type=Path,help='Optional existing MiiConnect24 index, used read-only; otherwise build/reuse cache from dumps')
+    p.add_argument('--ninrankings-dir',type=Path,default=Path('ninrankings'),help='Extracted NinRankings Ghost Database .rkg folder')
+    p.add_argument('--refresh-index',action='store_true',help='Rescan dumps for new/changed/removed files; unchanged files reuse cached rows')
+    p.add_argument('--reparse-index',action='store_true',help='Reparse every dump file; implies --refresh-index')
+    p.add_argument('--index-only',action='store_true',help='Build/check the comparison cache and exit without the menu')
     p.add_argument('--ctgp-dir',type=Path,default=Path('ctgp_profiles'))
     p.add_argument('--identities',type=Path)
     p.add_argument('--nin-pids-json',type=Path,default=Path('ninrankings_pids.json'),help='Local PID -> Mii-name-list JSON')
     p.add_argument('--mii-dir',type=Path,default=Path('miis'),help='Local Wii Mii files, named as in the PID JSON (default miis)')
     p.add_argument('--cache',type=Path,default=Path('mii_client_check_cache'))
-    args=p.parse_args();known=owners(args.identities);db=connect(args.index)
-    if db is None:print('No index found at '+str(args.index)+'. IDs can still be read; use --index to enable local comparisons.')
+    args=p.parse_args()
+    if args.reparse_index:args.refresh_index=True
+    if args.index and (args.refresh_index or args.reparse_index):p.error('A supplied --index is read-only; omit --index to refresh Portable’s own cache')
+    print('MiiConnect24 Portable',flush=True)
+    index_path=prepare_dump_index(args)
+    if args.index_only:
+        if index_path is None:raise ValueError('Nothing to index. Supply extracted dump folders.')
+        return
+    known=owners(args.identities);db=connect(index_path) if index_path else None
+    if db is None:print('No comparison index loaded. Input IDs and local Top1000 comparisons remain available.')
     try:
         while True:
             print('\n1 Chadsoft profile\n2 Ghost/Mii file or direct ghost URL\n3 NinRankings Top1000 profile\n4 Enter client ID\nq Quit')
