@@ -7,6 +7,7 @@ python mii_client_check.py
 python mii_client_check.py --ctgp-dir ctgp_profiles --ninrankings-dir ninrankings
 python mii_client_check.py --identities players.csv --nin-pids-json ninrankings_pids.json --mii-dir miis
 python mii_client_check.py --refresh-index --index-only
+python mii_client_check.py --refresh-top1000
 
 1 Chadsoft profile (ID, URL or local JSON)
 2 Local .rkg/.mii file or a direct ghost URL
@@ -19,6 +20,9 @@ results are cached in mii_client_check_cache. Top1000 uses only your local PID-t
 case-sensitive filename/stem plus numbered duplicate variants (Name_1.mii).
 Ambiguous filename associations are labelled as candidates, not proven ownership.
 No Top1000 page requests or name-only client-ID inference.
+The completed Top1000 lookup is saved across launches. After adding, editing or
+removing Mii files, use --refresh-top1000. Changing the PID JSON invalidates it
+automatically. Only completed builds replace the saved lookup.
 Friend codes are computed only from Top1000 online PIDs. Ghost Database
 profile links use the decimal Mii client ID, never the friend-code formula.
 """
@@ -30,6 +34,8 @@ from contextlib import contextmanager
 import os
 import time
 import hashlib
+import gzip
+import tempfile
 import json
 from pathlib import Path
 import re
@@ -237,9 +243,50 @@ def cached_mii(path,args):
     return item
 
 
+def top1000_cache_key(args):
+    return {'version':1,'pid_json':str(args.nin_pids_json.resolve()),
+            'pid_sha256':hashlib.sha256(args.nin_pids_json.read_bytes()).hexdigest(),
+            'mii_root':str(args.mii_dir.resolve())}
+
+
+def load_top1000_cache(args,key):
+    path=args.cache/'top1000_matches.json.gz'
+    if getattr(args,'refresh_top1000',False) or not path.is_file():return False
+    try:
+        print('  Loading saved Top1000 lookup...',flush=True)
+        with gzip.open(path,'rt',encoding='utf-8') as stream:data=json.load(stream)
+        if data.get('key')!=key:
+            print('  Top1000 inputs changed; rebuilding saved lookup.',flush=True);return False
+        if not isinstance(data.get('matches'),dict) or not isinstance(data.get('filenames'),dict):
+            raise ValueError('Incomplete lookup cache')
+        args._top_matches=data['matches']
+        args._mii_paths=defaultdict(set,{name:{Path(p) for p in paths} for name,paths in data['filenames'].items()})
+        args._mii_duplicates=defaultdict(set,{name:{Path(p) for p in paths} for name,paths in data['duplicates'].items()})
+        print('  Reused saved Top1000 lookup; no profile scan. Changed Mii files? Use --refresh-top1000.',flush=True)
+        return True
+    except (OSError,ValueError,KeyError,EOFError,TypeError) as exc:
+        print('  Cannot reuse Top1000 lookup; rebuilding: '+str(exc),flush=True);return False
+
+
+def save_top1000_cache(args,key):
+    args.cache.mkdir(parents=True,exist_ok=True)
+    data={'key':key,'matches':args._top_matches,
+          'filenames':{name:[str(p.resolve()) for p in sorted(paths)] for name,paths in args._mii_paths.items()},
+          'duplicates':{name:[str(p.resolve()) for p in sorted(paths)] for name,paths in args._mii_duplicates.items()}}
+    fd,temp=tempfile.mkstemp(prefix='top1000_',suffix='.tmp',dir=args.cache);os.close(fd)
+    try:
+        with gzip.open(temp,'wt',encoding='utf-8',compresslevel=1) as stream:
+            json.dump(data,stream,ensure_ascii=False,separators=(',',':'))
+        os.replace(temp,args.cache/'top1000_matches.json.gz')
+    finally:Path(temp).unlink(missing_ok=True)
+    print('  Saved completed Top1000 lookup for future launches.',flush=True)
+
+
 def top1000_matches(args):
     if hasattr(args,'_top_matches'):return args._top_matches
     if not args.nin_pids_json.is_file() or not args.mii_dir.is_dir():return {}
+    cache_key=top1000_cache_key(args)
+    if load_top1000_cache(args,cache_key):return args._top_matches
     prepare_local_miis(args)
     result=defaultdict(lambda:defaultdict(dict));missing=[];failures=[];ambiguities=[]
     entries=list(args._nin_pid_data.items())
@@ -267,6 +314,7 @@ def top1000_matches(args):
             w.writerows(('unreadable',path,error) for path,error in failures)
             w.writerows(('filename_candidate',pid,n+' -> '+path+'; ownership unverified') for pid,n,path in ambiguities)
         print(f'  Top1000 filename report: {len(missing)} missing names, {len(failures)} invalid/excluded files, {len(ambiguities)} ambiguous filename associations. See {args.cache/"top1000_mii_issues.csv"}')
+    save_top1000_cache(args,cache_key)
     return args._top_matches
 
 
@@ -566,6 +614,7 @@ def main():
     p.add_argument('--nin-pids-json',type=Path,default=Path('ninrankings_pids.json'),help='Local PID -> Mii-name-list JSON')
     p.add_argument('--mii-dir',type=Path,default=Path('miis'),help='Local Wii Mii files, named as in the PID JSON (default miis)')
     p.add_argument('--cache',type=Path,default=Path('mii_client_check_cache'))
+    p.add_argument('--refresh-top1000',action='store_true',help='Rebuild the saved Top1000 lookup after adding/changing/removing local Miis')
     args=p.parse_args()
     if args.reparse_index:args.refresh_index=True
     if args.index and (args.refresh_index or args.reparse_index):p.error('A supplied --index is read-only; omit --index to refresh Portable’s own cache')
@@ -586,6 +635,7 @@ def main():
                 value=input('Profile / file / client ID (blank cancels): ').strip().strip('"')
                 if not value:continue
                 source=set()
+                top=top1000_matches(args)
                 if choice=='1':miis,source=get_profile(value,args,db)
                 elif choice=='2':
                     if value.startswith(('http://','https://')):
@@ -597,7 +647,6 @@ def main():
                 elif choice=='3':miis,source=top1000(value,args)
                 else:miis=[{'client':client_id(value),'avatar':'','name':'','ghost':'','url':'','manual':True}]
                 if not miis:continue
-                top=top1000_matches(args)
                 exclude_nin=None
                 if choice=='3':exclude_nin=value if value.isdecimal() else parse_qs(urlparse(value).query).get('id',[None])[0]
                 check(miis,source,db,known,top,exclude_nin)
