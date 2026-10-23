@@ -17,7 +17,9 @@ python mii_client_check.py --refresh-top1000
 Profile lookups prefer local CTGP JSON, then the saved SQLite index. A profile
 missing locally may be fetched online, reading each ghost's RKG header. Network
 results are cached in mii_client_check_cache. Top1000 uses only your local PID-to-name JSON and Mii binaries, matched by
-case-sensitive filename/stem plus numbered duplicate variants (Name_1.mii).
+case-sensitive filename/stem plus numbered duplicate variants by default.
+Use --exact-filenames-only to disable numbered variants. PID associations from
+ambiguous filenames remain unverified.
 Ambiguous filename associations are labelled as candidates, not proven ownership.
 No Top1000 page requests or name-only client-ID inference.
 The completed Top1000 lookup is saved across launches. After adding, editing or
@@ -203,7 +205,7 @@ def mii_filename_candidates(name,args):
     exact=set(args._mii_paths.get(name,set()))
     # Extension spelling is immaterial; the name itself remains case-sensitive.
     exact.update(args._mii_paths.get(stem,set()))
-    variants=set(getattr(args,'_mii_duplicates',{}).get(stem,set()))
+    variants=set(getattr(args,'_mii_duplicates',{}).get(stem,set())) if getattr(args,'include_numbered_candidates',True) else set()
     return exact|variants,exact,stem
 
 
@@ -244,7 +246,7 @@ def cached_mii(path,args):
 
 
 def top1000_cache_key(args):
-    return {'version':1,'pid_json':str(args.nin_pids_json.resolve()),
+    return {'version':2,'include_numbered_candidates':bool(getattr(args,'include_numbered_candidates',True)),'pid_json':str(args.nin_pids_json.resolve()),
             'pid_sha256':hashlib.sha256(args.nin_pids_json.read_bytes()).hexdigest(),
             'mii_root':str(args.mii_dir.resolve())}
 
@@ -614,11 +616,16 @@ def main():
     p.add_argument('--nin-pids-json',type=Path,default=Path('ninrankings_pids.json'),help='Local PID -> Mii-name-list JSON')
     p.add_argument('--mii-dir',type=Path,default=Path('miis'),help='Local Wii Mii files, named as in the PID JSON (default miis)')
     p.add_argument('--cache',type=Path,default=Path('mii_client_check_cache'))
+    group=p.add_mutually_exclusive_group()
+    group.add_argument('--include-numbered-candidates',dest='include_numbered_candidates',action='store_true',help='Include Name_N.mii variants (default); ambiguous PID associations are unverified')
+    group.add_argument('--exact-filenames-only',dest='include_numbered_candidates',action='store_false',help='Check only exact filenames; exclude numbered variants')
+    p.set_defaults(include_numbered_candidates=True)
     p.add_argument('--refresh-top1000',action='store_true',help='Rebuild the saved Top1000 lookup after adding/changing/removing local Miis')
     args=p.parse_args()
     if args.reparse_index:args.refresh_index=True
     if args.index and (args.refresh_index or args.reparse_index):p.error('A supplied --index is read-only; omit --index to refresh Portable’s own cache')
     print('MiiConnect24 Portable',flush=True)
+    print('Top1000: '+('numbered filename guesses ENABLED (ownership unverified).' if args.include_numbered_candidates else 'exact filenames only; numbered filename guesses disabled.'),flush=True)
     index_path=prepare_dump_index(args)
     if args.index_only:
         if index_path is None:raise ValueError('Nothing to index. Supply extracted dump folders.')
